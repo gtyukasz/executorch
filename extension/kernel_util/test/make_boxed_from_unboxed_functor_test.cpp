@@ -84,6 +84,21 @@ Tensor& add_optional_tensor_out(
   return out;
 }
 
+using TensorList = executorch::aten::TensorList;
+
+void fill_tensor_list_out(
+    KernelRuntimeContext& ctx,
+    const Tensor& src,
+    TensorList out) {
+  (void)ctx;
+  for (size_t i = 0; i < out.size(); i++) {
+    for (int j = 0; j < out[i].numel(); j++) {
+      out[i].mutable_data_ptr<int32_t>()[j] =
+          src.const_data_ptr<int32_t>()[j];
+    }
+  }
+}
+
 class MakeBoxedFromUnboxedFunctorTest : public ::testing::Test {
  public:
   void SetUp() override {
@@ -175,6 +190,40 @@ TEST_F(MakeBoxedFromUnboxedFunctorTest, UnboxOptional) {
 
   // check result.
   EXPECT_EQ(stack[2]->toTensor().const_data_ptr<int32_t>()[0], 4);
+}
+
+TEST_F(MakeBoxedFromUnboxedFunctorTest, UnboxTensorListOut) {
+  EXECUTORCH_LIBRARY(my_ns, "fill_tensor_list.out", fill_tensor_list_out);
+  EXPECT_TRUE(registry_has_op_function("my_ns::fill_tensor_list.out"));
+
+  // prepare source tensor with value 7.
+  torch::executor::testing::TensorFactory<ScalarType::Int> tf;
+  Tensor src = tf.full({3}, 7);
+  EValue src_evalue(src);
+
+  // prepare TensorList output with 2 tensors.
+  Tensor out_storage[2] = {tf.zeros({3}), tf.zeros({3})};
+  EValue out_evalues[2] = {out_storage[0], out_storage[1]};
+  EValue* out_values_p[2] = {&out_evalues[0], &out_evalues[1]};
+  BoxedEvalueList<Tensor> out_box(out_values_p, out_storage, 2);
+  EValue boxed_out(&out_box);
+
+  auto fn = get_op_function_from_registry("my_ns::fill_tensor_list.out");
+  ASSERT_EQ(fn.error(), Error::Ok);
+
+  // run it.
+  KernelRuntimeContext context;
+  EValue values[2] = {src_evalue, boxed_out};
+  EValue* stack[2] = {&values[0], &values[1]};
+  (*fn)(context, Span<EValue*>(stack));
+
+  // check that both output tensors got filled with 7.
+  auto result_list = stack[1]->toTensorList();
+  for (size_t i = 0; i < result_list.size(); i++) {
+    for (int j = 0; j < result_list[i].numel(); j++) {
+      EXPECT_EQ(result_list[i].const_data_ptr<int32_t>()[j], 7);
+    }
+  }
 }
 
 TEST_F(MakeBoxedFromUnboxedFunctorTest, UnboxOptionalArrayRef) {

@@ -67,6 +67,29 @@ struct is_nonconst_tensor : std::false_type {};
 template <>
 struct is_nonconst_tensor<executorch::aten::Tensor&> : std::true_type {};
 
+// Template trait to check if a type is TensorList (ArrayRef<Tensor>)
+template <class T>
+struct is_tensor_list : std::false_type {};
+
+template <>
+struct is_tensor_list<executorch::aten::ArrayRef<executorch::aten::Tensor>>
+    : std::true_type {};
+
+// Check if the last argument in a typelist is a TensorList
+template <class TypeList>
+struct last_arg_is_tensor_list;
+
+template <>
+struct last_arg_is_tensor_list<typelist<>> : std::false_type {};
+
+template <class T>
+struct last_arg_is_tensor_list<typelist<T>> : is_tensor_list<std::decay_t<T>> {
+};
+
+template <class Head, class... Tail>
+struct last_arg_is_tensor_list<typelist<Head, Tail...>>
+    : last_arg_is_tensor_list<typelist<Tail...>> {};
+
 // Template trait to check if a type is a non-const tensor
 // Count non-const tensors in a typelist
 template <class TypeList>
@@ -212,9 +235,17 @@ struct WrapUnboxedIntoFunctor {
     constexpr size_t num_nonconst_tensors =
         kernel_util_internal::count_nonconst_tensors<
             ContextRemovedArgsType>::value;
-    static_assert(num_nonconst_tensors == 1, "Invalid number of inputs");
+    constexpr bool has_tensor_list_out =
+        kernel_util_internal::last_arg_is_tensor_list<
+            ContextRemovedArgsType>::value;
+    static_assert(
+        num_nonconst_tensors == 1 || has_tensor_list_out,
+        "Expected exactly one Tensor& output or a trailing TensorList output");
+    constexpr size_t outputs_to_log = has_tensor_list_out
+        ? 1
+        : num_nonconst_tensors;
     return kernel_util_internal::
-        call_functor_with_args_from_stack<FuncType, num_nonconst_tensors>(
+        call_functor_with_args_from_stack<FuncType, outputs_to_log>(
             ctx,
             stack,
             std::make_index_sequence<num_inputs>(),
