@@ -1360,6 +1360,68 @@ def _apply_algo_to_submodules(
     return bufsizes
 
 
+def _place_cond_outputs_in_parent_slots(  # noqa: C901
+    graph_module: torch.fx.GraphModule,
+) -> None:
+    """
+    The emitter aliases a cond's outputs to the branch outputs with MoveCall
+    instead of copying them, and branch tensors live in the region shared by
+    every control-flow submodule of this graph. Make each branch write its
+    outputs into the slots the parent planned for the cond outputs, then
+    recurse so a nested cond whose output is the branch output follows them.
+    """
+    owners: Dict[str, Set[Node]] = defaultdict(set)
+    for cond_node in get_cond_nodes(graph_module):
+        for branch in cond_node.args[1:3]:
+            owners[branch.target].add(cond_node)
+
+    for cond_node in get_cond_nodes(graph_module):
+        parent_specs = tree_flatten(cond_node.meta["spec"])[0]
+        for branch in cond_node.args[1:3]:
+            if len(owners[branch.target]) > 1:
+                continue
+            submodule = getattr(graph_module, branch.target)
+            storage_bases: Set[TensorSpec] = set()
+            for node in submodule.graph.nodes:
+                for spec in get_node_tensor_specs(node):
+                    base = spec.storage_base if isinstance(spec, TensorSpec) else None
+                    while base is not None:
+                        storage_bases.add(base)
+                        base = base.storage_base
+            output_node = submodule.graph.output_node()
+            slots: Dict[TensorSpec, TensorSpec] = {}
+            for arg, parent_spec in zip(
+                tree_flatten(output_node.args[0])[0], parent_specs
+            ):
+                if not (
+                    isinstance(arg, Node)
+                    and arg.op == "call_function"
+                    and arg.target is not memory.view
+                    and isinstance(parent_spec, TensorSpec)
+                    and parent_spec.mem_id is not None
+                    and parent_spec.mem_offset is not None
+                ):
+                    continue
+                spec = arg.meta.get("spec")
+                if (
+                    not isinstance(spec, TensorSpec)
+                    or spec.const
+                    or spec.mem_id is None
+                    or spec.storage_base is not None
+                    or spec in storage_bases
+                    or spec.allocated_memory > parent_spec.allocated_memory
+                ):
+                    continue
+                slot = slots.get(spec)
+                if slot is None or parent_spec.lifetime[1] > slot.lifetime[1]:
+                    slots[spec] = parent_spec
+            for spec, parent_spec in slots.items():
+                spec.mem_id = parent_spec.mem_id
+                spec.mem_offset = parent_spec.mem_offset
+                spec.mem_obj_id = parent_spec.mem_obj_id
+            _place_cond_outputs_in_parent_slots(submodule)
+
+
 _CPU_KEY: tuple[DeviceType, int] = (DeviceType.CPU, 0)
 
 
@@ -1577,6 +1639,8 @@ def apply_algo(
     if len(global_bufsizes) < 2:
         global_bufsizes.append(0)
         buffer_devices.append(_CPU_KEY)
+
+    _place_cond_outputs_in_parent_slots(graph_module)
 
     # Insert free calls and build device buffer mapping
     insert_calls_to_free(graph_module, all_specs)
